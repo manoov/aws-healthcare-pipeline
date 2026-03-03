@@ -1,0 +1,289 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Healthcare Waveform Pipeline — S3 buckets, DynamoDB metadata table,
+  Lambda processor, Athena workgroup, and Glue catalog for querying
+  processed MIMIC waveform data.
+
+# -----------------------------------------------------------------------
+#  Parameters
+# -----------------------------------------------------------------------
+Parameters:
+  EnvironmentTag:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment label.
+
+  DynamoDBBillingMode:
+    Type: String
+    Default: PAY_PER_REQUEST
+    AllowedValues: [PAY_PER_REQUEST, PROVISIONED]
+    Description: DynamoDB billing mode.
+
+# -----------------------------------------------------------------------
+#  Resources
+# -----------------------------------------------------------------------
+Resources:
+
+  # ---- S3 Buckets -----------------------------------------------------
+  RawWaveformBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-raw-waveforms-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+        - Key: Project
+          Value: healthcare-waveform-pipeline
+
+  ProcessedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-processed-data-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-athena-results-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireQueryResults
+            Status: Enabled
+            ExpirationInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  # ---- DynamoDB Table -------------------------------------------------
+  WaveformRecordsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: WaveformRecords
+      BillingMode: !Ref DynamoDBBillingMode
+      AttributeDefinitions:
+        - AttributeName: record_id
+          AttributeType: S
+        - AttributeName: patient_id
+          AttributeType: S
+        - AttributeName: processing_status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: record_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: PatientIndex
+          KeySchema:
+            - AttributeName: patient_id
+              KeyType: HASH
+            - AttributeName: record_id
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: processing_status
+              KeyType: HASH
+            - AttributeName: record_id
+              KeyType: RANGE
+          Projection:
+            ProjectionType: KEYS_ONLY
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  # ---- IAM Role for Lambda --------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: WaveformPipelineAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt RawWaveformBucket.Arn
+                  - !Sub "${RawWaveformBucket.Arn}/*"
+                  - !GetAtt ProcessedDataBucket.Arn
+                  - !Sub "${ProcessedDataBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt WaveformRecordsTable.Arn
+                  - !Sub "${WaveformRecordsTable.Arn}/index/*"
+
+  # ---- Lambda Function ------------------------------------------------
+  WaveformProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-waveform-processor"
+      Runtime: python3.11
+      Handler: handler.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref WaveformRecordsTable
+          PROCESSED_BUCKET: !Ref ProcessedDataBucket
+          RAW_BUCKET: !Ref RawWaveformBucket
+      Code:
+        ZipFile: |
+          # Placeholder — deploy the real handler via `aws lambda update-function-code`
+          def lambda_handler(event, context):
+              return {"statusCode": 200, "body": "Placeholder — update with real code."}
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  # S3 → Lambda trigger (fires on .hea uploads to raw bucket)
+  RawBucketNotificationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WaveformProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt RawWaveformBucket.Arn
+
+  # ---- Athena / Glue Catalog ------------------------------------------
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: healthcare_waveforms
+        Description: Catalog for processed healthcare waveform data.
+
+  ProcessedWaveformGlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: processed_waveforms
+        Description: Processed waveform samples with original and reconstructed values.
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: csv
+          skip.header.line.count: "1"
+        StorageDescriptor:
+          Columns:
+            - Name: record_id
+              Type: string
+            - Name: sample_index
+              Type: int
+            - Name: original_value
+              Type: float
+            - Name: reconstructed_value
+              Type: float
+            - Name: channel
+              Type: string
+            - Name: compression_method
+              Type: string
+          Location: !Sub "s3://${ProcessedDataBucket}/processed/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.serde2.OpenCSVSerde
+            Parameters:
+              separatorChar: ","
+
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: healthcare-workgroup
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${AthenaResultsBucket}/results/"
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 1073741824  # 1 GB safety limit
+
+# -----------------------------------------------------------------------
+#  Outputs
+# -----------------------------------------------------------------------
+Outputs:
+  RawWaveformBucketName:
+    Value: !Ref RawWaveformBucket
+    Description: S3 bucket for raw MIMIC waveform files.
+
+  ProcessedDataBucketName:
+    Value: !Ref ProcessedDataBucket
+    Description: S3 bucket for processed / compressed waveform data.
+
+  AthenaResultsBucketName:
+    Value: !Ref AthenaResultsBucket
+    Description: S3 bucket for Athena query results.
+
+  DynamoDBTableName:
+    Value: !Ref WaveformRecordsTable
+    Description: DynamoDB table for record metadata.
+
+  LambdaFunctionArn:
+    Value: !GetAtt WaveformProcessorFunction.Arn
+    Description: ARN of the waveform processor Lambda.
+
+  AthenaWorkgroupName:
+    Value: !Ref AthenaWorkgroup
+    Description: Athena workgroup for querying processed data.
+
+  GlueDatabaseName:
+    Value: !Ref GlueDatabase
+    Description: Glue catalog database name.
